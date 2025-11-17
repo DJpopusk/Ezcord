@@ -19,6 +19,10 @@ let currentServerId = null;
 let currentDMUserId = null;
 let activeHubMode = 'u2u';
 let currentDMAvatar = null;
+let currentViewContext = null;
+let viewHistory = [];
+let globalSearchQuery = '';
+let callPopoverFriend = null;
 // Initialize
 document.addEventListener('DOMContentLoaded', () => {
     token = localStorage.getItem('token');
@@ -42,6 +46,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
 function initializeApp() {
     updateUserInfo();
+    initializeToolbar();
     initializeFriendsTabs();
     initializeChannels();
     initializeMessageInput();
@@ -50,11 +55,218 @@ function initializeApp() {
     initializeServerManagement();
     initializeFileUpload();
     initializeDraggableCallWindow();
+    initializeCallPopover();
     connectToSocketIO();
     requestNotificationPermission();
     loadUserServers();
     initializeHubNavigation();
     activateHubSegment('u2u');
+}
+
+function initializeToolbar() {
+    const backBtn = document.getElementById('backBtn');
+    if (backBtn) {
+        backBtn.addEventListener('click', handleBackNavigation);
+    }
+
+    const searchInput = document.getElementById('globalSearchInput');
+    if (searchInput) {
+        searchInput.addEventListener('input', (event) => handleGlobalSearch(event.target.value));
+    }
+
+    updateToolbarState();
+}
+
+function initializeCallPopover() {
+    const popover = document.getElementById('callTypePopover');
+    if (!popover) return;
+
+    const audioBtn = popover.querySelector('[data-call-type=\"audio\"]');
+    const videoBtn = popover.querySelector('[data-call-type=\"video\"]');
+
+    if (audioBtn) {
+        audioBtn.addEventListener('click', () => handleCallTypeSelection('audio'));
+    }
+
+    if (videoBtn) {
+        videoBtn.addEventListener('click', () => handleCallTypeSelection('video'));
+    }
+
+    document.addEventListener('click', (event) => {
+        if (popover.contains(event.target)) return;
+        if (event.target.closest('.call-target')) return;
+        hideCallTypePopover();
+    });
+
+    window.addEventListener('resize', hideCallTypePopover);
+    window.addEventListener('scroll', hideCallTypePopover, true);
+    document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') {
+            hideCallTypePopover();
+        }
+    });
+}
+
+function setCurrentView(view, options = {}) {
+    const { skipHistory = false, context = null } = options;
+    if (!skipHistory && currentView && currentView !== view) {
+        const snapshot = currentViewContext ? { ...currentViewContext } : null;
+        viewHistory.push({ view: currentView, context: snapshot });
+        if (viewHistory.length > 10) {
+            viewHistory.shift();
+        }
+    }
+
+    currentView = view;
+    currentViewContext = context;
+
+    if (view !== 'calls') {
+        hideCallTypePopover();
+    }
+
+    updateToolbarState();
+}
+
+function updateToolbarState() {
+    const searchContainer = document.getElementById('toolbarSearchContainer');
+    if (searchContainer) {
+        searchContainer.style.display = currentView === 'dm' ? 'none' : 'flex';
+    }
+
+    const backBtn = document.getElementById('backBtn');
+    if (backBtn) {
+        const canGoBack = currentView === 'dm' || viewHistory.length > 0;
+        backBtn.disabled = !canGoBack;
+        backBtn.classList.toggle('disabled', !canGoBack);
+    }
+
+    if (currentView !== 'dm') {
+        applyGlobalSearch();
+    }
+}
+
+function handleBackNavigation() {
+    if (currentView === 'dm' && viewHistory.length === 0) {
+        showFriendsView(false, { skipHistory: true });
+        return;
+    }
+
+    if (!viewHistory.length) return;
+
+    const previous = viewHistory.pop();
+    if (!previous) return;
+
+    switch (previous.view) {
+        case 'friends':
+            showFriendsView(false, { skipHistory: true });
+            break;
+        case 'server': {
+            const serverId = previous.context?.serverId;
+            let targetServer = serverId ? servers.find(server => server.id === serverId) : null;
+            if (!targetServer && servers.length > 0) {
+                targetServer = servers[0];
+            }
+            if (targetServer) {
+                showServerView(targetServer, true, { skipHistory: true });
+            } else {
+                showFriendsView(false, { skipHistory: true });
+            }
+            break;
+        }
+        case 'calls':
+            showCallsView(true, { skipHistory: true });
+            refreshCallRoster();
+            renderVoiceShortcuts();
+            break;
+        case 'dm':
+            if (previous.context?.userId) {
+                startDM(
+                    previous.context.userId,
+                    previous.context.username || 'Direct Message',
+                    previous.context.avatar || null,
+                    { skipHistory: true }
+                );
+            } else {
+                showFriendsView(false, { skipHistory: true });
+            }
+            break;
+        default:
+            showFriendsView(false, { skipHistory: true });
+    }
+}
+
+function handleGlobalSearch(value = '') {
+    globalSearchQuery = value.toLowerCase();
+    applyGlobalSearch();
+}
+
+function applyGlobalSearch() {
+    if (currentView === 'dm') return;
+    const query = globalSearchQuery.trim();
+    if (currentView === 'friends') {
+        filterElements('#friendsView .friend-item', query);
+        filterElements('#dmList .dm-entry', query);
+    } else if (currentView === 'server') {
+        filterElements('#channelsView .channel', query);
+    } else if (currentView === 'calls') {
+        filterElements('#callRoster .call-target', query);
+    }
+}
+
+function filterElements(selector, query) {
+    const items = document.querySelectorAll(selector);
+    if (!items.length) return;
+    items.forEach(item => {
+        const text = (item.textContent || '').toLowerCase();
+        const matches = !query || text.includes(query);
+        item.style.display = matches ? '' : 'none';
+    });
+}
+
+function showCallTypePopover(card, friend) {
+    const popover = document.getElementById('callTypePopover');
+    if (!popover) return;
+
+    callPopoverFriend = friend;
+
+    const rect = card.getBoundingClientRect();
+    const popoverWidth = popover.offsetWidth || 160;
+    const popoverHeight = popover.offsetHeight || 100;
+    const scrollX = window.scrollX || window.pageXOffset;
+    const scrollY = window.scrollY || window.pageYOffset;
+    const viewportRight = scrollX + window.innerWidth;
+    const viewportBottom = scrollY + window.innerHeight;
+
+    let left = rect.right + scrollX + 12;
+    if (left + popoverWidth > viewportRight) {
+        left = rect.left + scrollX - popoverWidth - 12;
+    }
+    left = Math.max(12, left);
+
+    let top = rect.top + scrollY + rect.height / 2 - popoverHeight / 2;
+    if (top + popoverHeight > viewportBottom) {
+        top = viewportBottom - popoverHeight - 12;
+    }
+    if (top < scrollY + 12) {
+        top = scrollY + 12;
+    }
+
+    popover.style.left = `${left}px`;
+    popover.style.top = `${top}px`;
+    popover.classList.add('visible');
+}
+
+function hideCallTypePopover() {
+    const popover = document.getElementById('callTypePopover');
+    if (!popover) return;
+    popover.classList.remove('visible');
+    callPopoverFriend = null;
+}
+
+function handleCallTypeSelection(type) {
+    if (!callPopoverFriend) return;
+    initiateCall(callPopoverFriend.id, type);
+    hideCallTypePopover();
 }
 
 function requestNotificationPermission() {
@@ -388,6 +600,10 @@ function displayFriends(friends) {
     friends.forEach(friend => {
         allList.appendChild(createFriendItem(friend));
     });
+
+    if (globalSearchQuery && currentView === 'friends') {
+        applyGlobalSearch();
+    }
 }
 
 function createFriendItem(friend) {
@@ -756,8 +972,8 @@ function rejectCall(caller) {
     }
 }
 
-window.startDM = async function(friendId, friendUsername, friendAvatar = null) {
-    currentView = 'dm';
+window.startDM = async function(friendId, friendUsername, friendAvatar = null, options = {}) {
+    setCurrentView('dm', { ...options, context: { userId: friendId, username: friendUsername, avatar: friendAvatar } });
     currentDMUserId = friendId;
     currentServerId = null;
     currentDMAvatar = friendAvatar;
@@ -777,8 +993,8 @@ window.startDM = async function(friendId, friendUsername, friendAvatar = null) {
 };
 
 // Show friends view
-function showFriendsView(fromHub = false) {
-    currentView = 'friends';
+function showFriendsView(fromHub = false, viewOptions = {}) {
+    setCurrentView('friends', { ...viewOptions, context: null });
     currentDMUserId = null;
     currentServerId = null;
     currentDMAvatar = null;
@@ -791,7 +1007,10 @@ function showFriendsView(fromHub = false) {
     document.getElementById('serverName').textContent = 'Friends';
     
     document.querySelectorAll('.server-icon').forEach(icon => icon.classList.remove('active'));
-    document.getElementById('friendsBtn').classList.add('active');
+    const friendsBtn = document.getElementById('friendsBtn');
+    if (friendsBtn) {
+        friendsBtn.classList.add('active');
+    }
     
     if (!fromHub) {
         activateHubSegment('u2u', { triggerView: false });
@@ -799,8 +1018,8 @@ function showFriendsView(fromHub = false) {
 }
 
 // Show server view
-function showServerView(server, fromHub = false) {
-    currentView = 'server';
+function showServerView(server, fromHub = false, viewOptions = {}) {
+    setCurrentView('server', { ...viewOptions, context: { serverId: server.id } });
     currentServerId = server.id;
     currentDMUserId = null;
     currentDMAvatar = null;
@@ -819,8 +1038,8 @@ function showServerView(server, fromHub = false) {
     switchChannel('general');
 }
 
-function showCallsView(fromHub = false) {
-    currentView = 'calls';
+function showCallsView(fromHub = false, viewOptions = {}) {
+    setCurrentView('calls', { ...viewOptions, context: null });
     currentDMUserId = null;
     currentServerId = null;
     currentDMAvatar = null;
@@ -856,6 +1075,7 @@ async function refreshCallRoster() {
     const roster = document.getElementById('callRoster');
     if (!roster) return;
     roster.innerHTML = '<div class="friends-empty">Loading roster...</div>';
+    hideCallTypePopover();
     
     try {
         const response = await fetch('/api/friends', {
@@ -867,41 +1087,27 @@ async function refreshCallRoster() {
             roster.innerHTML = '<div class="friends-empty">No friends available for calls yet.</div>';
             return;
         }
-            roster.innerHTML = '';
-            friends.forEach(friend => {
-                const card = document.createElement('div');
-                card.className = 'call-target';
-                card.innerHTML = `
+        roster.innerHTML = '';
+        friends.forEach(friend => {
+            const card = document.createElement('div');
+            card.className = 'call-target';
+            card.innerHTML = `
                 <div class="call-target-avatar"></div>
                 <div class="call-target-labels">
                     <span class="call-target-name">${friend.username}</span>
                     <span class="call-target-status">${friend.status || 'Offline'}</span>
                 </div>
             `;
-                applyAvatar(card.querySelector('.call-target-avatar'), friend.avatar, friend.username);
-            const actions = document.createElement('div');
-            actions.className = 'call-target-actions';
-            const audioBtn = document.createElement('button');
-            audioBtn.className = 'mini-call-btn';
-            audioBtn.textContent = 'Audio';
-            audioBtn.addEventListener('click', (e) => {
-                e.stopPropagation();
-                initiateCall(friend.id, 'audio');
-            });
-            const videoBtn = document.createElement('button');
-            videoBtn.className = 'mini-call-btn primary';
-            videoBtn.textContent = 'Video';
-            videoBtn.addEventListener('click', (e) => {
-                e.stopPropagation();
-                initiateCall(friend.id, 'video');
-            });
-            actions.appendChild(audioBtn);
-            actions.appendChild(videoBtn);
-            card.appendChild(actions);
+            applyAvatar(card.querySelector('.call-target-avatar'), friend.avatar, friend.username);
 
-            card.addEventListener('click', () => initiateCall(friend.id, 'video'));
+            card.addEventListener('click', (event) => {
+                event.stopPropagation();
+                showCallTypePopover(card, friend);
+            });
+
             roster.appendChild(card);
         });
+        applyGlobalSearch();
     } catch (error) {
         console.error('Error loading call roster:', error);
         roster.innerHTML = '<div class="friends-empty">Unable to load friends list.</div>';
@@ -944,13 +1150,17 @@ function initializeServerManagement() {
     const friendsBtn = document.getElementById('friendsBtn');
     const addServerBtn = document.getElementById('addServerBtn');
     
-    friendsBtn.addEventListener('click', () => {
-        activateHubSegment('u2u');
-    });
+    if (friendsBtn) {
+        friendsBtn.addEventListener('click', () => {
+            activateHubSegment('u2u');
+        });
+    }
     
-    addServerBtn.addEventListener('click', () => {
-        createNewServer();
-    });
+    if (addServerBtn) {
+        addServerBtn.addEventListener('click', () => {
+            createNewServer();
+        });
+    }
 }
 
 async function createNewServer() {
@@ -982,6 +1192,10 @@ async function createNewServer() {
 function addServerToUI(server, switchTo = false) {
     const serverList = document.querySelector('.server-list');
     const addServerBtn = document.getElementById('addServerBtn');
+
+    if (!serverList || !addServerBtn) {
+        return;
+    }
     
     const serverIcon = document.createElement('div');
     serverIcon.className = 'server-icon';
@@ -1735,6 +1949,8 @@ if (currentUser) {
 
 function populateDMList(friends) {
    const dmList = document.getElementById('dmList');
+   if (!dmList) return;
+
    dmList.innerHTML = '';
 
    if (friends.length === 0) {
@@ -1747,17 +1963,22 @@ function populateDMList(friends) {
 
    friends.forEach(friend => {
        const dmItem = document.createElement('div');
-       dmItem.className = 'channel';
+       dmItem.className = 'channel dm-entry';
        dmItem.setAttribute('data-dm-id', friend.id);
        dmItem.innerHTML = `
-           <div class="friend-avatar">${friend.avatar || friend.username.charAt(0).toUpperCase()}</div>
+           <div class="friend-avatar"></div>
            <span>${friend.username}</span>
        `;
+       applyAvatar(dmItem.querySelector('.friend-avatar'), friend.avatar, friend.username);
        dmItem.addEventListener('click', () => {
            startDM(friend.id, friend.username, friend.avatar);
        });
        dmList.appendChild(dmItem);
    });
+
+   if (globalSearchQuery && currentView === 'friends') {
+       applyGlobalSearch();
+   }
 }
 
 // WebRTC Functions
